@@ -345,6 +345,8 @@ class GroupCreateRequest(BaseModel):
     name: str
     description: Optional[str] = None
     privacy: str = "private"
+    group_type: str = "general"  # general, challenge, accountability
+    settings: dict = {}
 
 class GroupMessageRequest(BaseModel):
     message: str
@@ -358,11 +360,35 @@ class ChallengeCreateRequest(BaseModel):
 @community_router.post("/groups/create")
 def create_group(request: GroupCreateRequest, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
     user = _resolve_user(db, user_id)
-    group = Group(id=generate_id("group"), creator_id=user.id, name=request.name,
-                   description=request.description, members=[user.id], privacy=request.privacy)
+    group = Group(
+        id=generate_id("group"), creator_id=user.id, name=request.name,
+        description=request.description, members=[user.id], privacy=request.privacy,
+        group_type=request.group_type, settings=request.settings,
+    )
     db.add(group)
     db.commit()
-    return {"id": group.id, "name": group.name}
+    return {
+        "id": group.id, "name": group.name, "group_type": group.group_type,
+        "members": group.members, "privacy": group.privacy,
+    }
+
+
+@community_router.get("/groups")
+def list_my_groups(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """Real list of groups the current user belongs to. Empty list if none — never fake data."""
+    user = _resolve_user(db, user_id)
+    all_groups = db.query(Group).all()
+    mine = [g for g in all_groups if user.id in (g.members or [])]
+    return {
+        "groups": [
+            {
+                "id": g.id, "name": g.name, "description": g.description,
+                "members": len(g.members or []), "group_type": g.group_type,
+                "privacy": g.privacy,
+            }
+            for g in mine
+        ]
+    }
 
 
 @community_router.get("/groups/{group_id}")
@@ -370,7 +396,11 @@ def get_group(group_id: str, db: Session = Depends(get_db), user_id: str = Depen
     group = db.query(Group).filter(Group.id == group_id).first()
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
-    return {"id": group.id, "name": group.name, "description": group.description, "members": group.members, "privacy": group.privacy}
+    return {
+        "id": group.id, "name": group.name, "description": group.description,
+        "members": group.members, "privacy": group.privacy,
+        "group_type": group.group_type, "settings": group.settings,
+    }
 
 
 @community_router.post("/groups/{group_id}/message")

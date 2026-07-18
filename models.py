@@ -185,6 +185,13 @@ class Group(Base):
     description = Column(Text, nullable=True)
     members = Column(JSON, default=[])  # List of user_ids
     privacy = Column(String, default="private")  # private, public
+
+    # Configurable group type — owner picks the shape their group takes.
+    # "general" = free-form chat/activity feed
+    # "challenge" = built around a shared goal/streak
+    # "accountability" = check-in based (daily/weekly)
+    group_type = Column(String, default="general")
+    settings = Column(JSON, default={})  # type-specific config, e.g. {"checkin_frequency": "daily"}
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
