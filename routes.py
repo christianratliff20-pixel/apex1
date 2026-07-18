@@ -13,7 +13,7 @@ from anthropic import Anthropic
 from database import get_db
 from models import (
     FeedItem, User, MacroLog, WorkoutLog, VitalLog,
-    Group, GroupMessage, Challenge,
+    Group, GroupMessage, Challenge, Comment, Collection,
 )
 from auth import get_current_user_id
 from helpers import generate_id
@@ -133,6 +133,105 @@ def save_item(item_id: str, db: Session = Depends(get_db), user_id: str = Depend
     item.saves += 1
     db.commit()
     return {"saves": item.saves}
+
+
+class CommentRequest(BaseModel):
+    text: str
+
+@feed_router.get("/{item_id}/comments")
+def get_comments(item_id: str, db: Session = Depends(get_db)):
+    """Real comments for a feed item. Empty list if none — never fake data."""
+    comments = db.query(Comment).filter(Comment.feed_item_id == item_id).order_by(Comment.created_at.desc()).all()
+    result = []
+    for c in comments:
+        author = db.query(User).filter(User.id == c.user_id).first()
+        result.append({
+            "id": c.id,
+            "text": c.text,
+            "likes": c.likes,
+            "author": author.username if author else "unknown",
+            "created_at": c.created_at.isoformat(),
+        })
+    return {"comments": result}
+
+
+@feed_router.post("/{item_id}/comments")
+def post_comment(item_id: str, request: CommentRequest, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    user = _resolve_user(db, user_id)
+    item = db.query(FeedItem).filter(FeedItem.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    if not request.text.strip():
+        raise HTTPException(status_code=400, detail="Comment cannot be empty")
+
+    comment = Comment(id=generate_id("comment"), feed_item_id=item_id, user_id=user.id, text=request.text.strip())
+    db.add(comment)
+    item.comments += 1
+    db.commit()
+    db.refresh(comment)
+
+    return {
+        "id": comment.id,
+        "text": comment.text,
+        "likes": comment.likes,
+        "author": user.username,
+        "created_at": comment.created_at.isoformat(),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# COLLECTIONS
+# ═══════════════════════════════════════════════════════════════════════
+
+class CollectionCreateRequest(BaseModel):
+    name: str
+
+@feed_router.get("/collections")
+def list_collections(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """Real list of the current user's collections. Empty list if none."""
+    user = _resolve_user(db, user_id)
+    collections = db.query(Collection).filter(Collection.user_id == user.id).order_by(Collection.created_at.desc()).all()
+    return {
+        "collections": [
+            {"id": c.id, "name": c.name, "item_count": len(c.items or [])}
+            for c in collections
+        ]
+    }
+
+
+@feed_router.post("/collections")
+def create_collection(request: CollectionCreateRequest, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    user = _resolve_user(db, user_id)
+    if not request.name.strip():
+        raise HTTPException(status_code=400, detail="Collection name cannot be empty")
+
+    collection = Collection(id=generate_id("collection"), user_id=user.id, name=request.name.strip(), items=[])
+    db.add(collection)
+    db.commit()
+    db.refresh(collection)
+    return {"id": collection.id, "name": collection.name, "item_count": 0}
+
+
+@feed_router.post("/collections/{collection_id}/items/{item_id}")
+def add_item_to_collection(collection_id: str, item_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    user = _resolve_user(db, user_id)
+    collection = db.query(Collection).filter(Collection.id == collection_id, Collection.user_id == user.id).first()
+    if not collection:
+        raise HTTPException(status_code=404, detail="Collection not found")
+
+    item = db.query(FeedItem).filter(FeedItem.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Feed item not found")
+
+    items = list(collection.items or [])
+    if item_id not in items:
+        items.append(item_id)
+        collection.items = items
+        item.saves += 1
+        db.commit()
+
+    return {"id": collection.id, "name": collection.name, "item_count": len(collection.items)}
 
 
 # ═══════════════════════════════════════════════════════════════════════

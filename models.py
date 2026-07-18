@@ -85,6 +85,18 @@ class FeedItem(Base):
     # Relationships
     author = relationship("User", back_populates="feed_items")
 
+class Comment(Base):
+    __tablename__ = "comments"
+
+    id = Column(String, primary_key=True, index=True)
+    feed_item_id = Column(String, ForeignKey("feed_items.id"), index=True)
+    user_id = Column(String, ForeignKey("users.id"))
+
+    text = Column(Text)
+    likes = Column(Integer, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
 class MacroLog(Base):
     __tablename__ = "macro_logs"
     
