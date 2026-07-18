@@ -52,14 +52,7 @@ def verify_token(token: str) -> dict:
 # ── Dependency used by every protected route ────────────────────────────
 
 def get_current_user_id(authorization: str = Header(None)) -> str:
-    """
-    Returns the current user's ID.
-    If DEV_MODE=true in env vars, this bypasses auth completely and
-    always returns the dev user ID — no token required.
-    """
-    if settings.dev_mode:
-        return settings.dev_user_id
-
+    """Returns the current user's ID from a valid Bearer token. No bypass."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid authorization")
 
@@ -70,23 +63,6 @@ def get_current_user_id(authorization: str = Header(None)) -> str:
         raise HTTPException(status_code=401, detail="Invalid token")
 
     return payload["user_id"]
-
-
-def get_or_create_dev_user(db: Session) -> User:
-    """Ensures the dev bypass user exists in the DB so foreign keys don't break."""
-    user = db.query(User).filter(User.id == settings.dev_user_id).first()
-    if not user:
-        user = User(
-            id=settings.dev_user_id,
-            username="dev_chris",
-            email="dev@apex.local",
-            hashed_password=hash_password("dev-mode-no-password"),
-            display_name="Chris (Dev)",
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    return user
 
 
 # ── Request/response schemas ─────────────────────────────────────────────
@@ -231,12 +207,9 @@ def apple_auth(request: AppleAuthRequest, db: Session = Depends(get_db)):
 
 @router.get("/me")
 def get_me(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
-    if settings.dev_mode:
-        user = get_or_create_dev_user(db)
-    else:
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
     return {
         "id": user.id,
@@ -245,5 +218,4 @@ def get_me(db: Session = Depends(get_db), user_id: str = Depends(get_current_use
         "display_name": user.display_name,
         "subscription": user.subscription,
         "is_creator": user.is_creator,
-        "dev_mode": settings.dev_mode,
     }

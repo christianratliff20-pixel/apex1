@@ -15,7 +15,7 @@ from models import (
     FeedItem, User, MacroLog, WorkoutLog, VitalLog,
     Group, GroupMessage, Challenge,
 )
-from auth import get_current_user_id, get_or_create_dev_user
+from auth import get_current_user_id
 from helpers import generate_id
 from moderation import run_moderation_pipeline
 from config import settings
@@ -32,9 +32,7 @@ community_router = APIRouter()
 
 
 def _resolve_user(db: Session, user_id: str) -> User:
-    """In dev mode, auto-creates/returns the dev user. Otherwise looks up normally."""
-    if settings.dev_mode:
-        return get_or_create_dev_user(db)
+    """Looks up the authenticated user or 404s. No bypass."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")

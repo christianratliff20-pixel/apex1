@@ -12,7 +12,7 @@ from config import settings
 async def lifespan(app: FastAPI):
     print("Initializing database...")
     init_db()
-    print(f"Database ready. Dev mode: {settings.dev_mode}")
+    print("Database ready.")
     yield
     print("Shutting down...")
 
@@ -43,7 +43,7 @@ app.include_router(community_router, prefix="/api/community", tags=["Community"]
 
 @app.get("/")
 def root():
-    return {"message": "Apex API is running", "docs": "/docs", "dev_mode": settings.dev_mode}
+    return {"message": "Apex API is running", "docs": "/docs"}
 
 
 @app.get("/health")

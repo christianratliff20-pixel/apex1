@@ -15,10 +15,6 @@ class Settings(BaseSettings):
     jwt_algorithm: str = os.getenv("JWT_ALGORITHM", "HS256")
     jwt_expiration_hours: int = int(os.getenv("JWT_EXPIRATION_HOURS", "24"))
 
-    # Dev bypass — set DEV_MODE=true in Render env vars to skip auth entirely
-    dev_mode: bool = os.getenv("DEV_MODE", "False").lower() == "true"
-    dev_user_id: str = os.getenv("DEV_USER_ID", "dev_user_chris")
-
     # OAuth
     google_client_id: str = os.getenv("GOOGLE_CLIENT_ID", "")
     google_client_secret: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
