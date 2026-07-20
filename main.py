@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
 from auth import router as auth_router
-from routes import feed_router, coach_router, macros_router, workouts_router, vitals_router, community_router
+from routes import feed_router, coach_router, macros_router, workouts_router, vitals_router, community_router, body_router, supplements_router, history_router, food_router
 from database import init_db
 from config import settings
 
@@ -38,6 +38,10 @@ app.include_router(coach_router, prefix="/api/coach", tags=["Coach"])
 app.include_router(macros_router, prefix="/api/macros", tags=["Macros"])
 app.include_router(workouts_router, prefix="/api/workouts", tags=["Workouts"])
 app.include_router(vitals_router, prefix="/api/vitals", tags=["Vitals"])
+app.include_router(body_router, prefix="/api/body", tags=["Body"])
+app.include_router(supplements_router, prefix="/api/supplements", tags=["Supplements"])
+app.include_router(history_router, prefix="/api/history", tags=["History"])
+app.include_router(food_router, prefix="/api/food", tags=["Food"])
 app.include_router(community_router, prefix="/api/community", tags=["Community"])
 
 

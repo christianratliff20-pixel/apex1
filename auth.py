@@ -203,6 +203,43 @@ def apple_auth(request: AppleAuthRequest, db: Session = Depends(get_db)):
     return {"access_token": access_token, "user_id": user.id}
 
 
+# ── TEMPORARY DEV PASSKEY LOGIN ──────────────────────────────────────────
+# Delete this whole block (plus the dev_passkey field in config.py) once
+# development wraps up. Only active when DEV_PASSKEY is set in Render env
+# vars — with it unset, this route always 404s and cannot be used at all.
+
+class DevPasskeyRequest(BaseModel):
+    passkey: str
+
+@router.post("/dev-login", response_model=TokenResponse)
+def dev_passkey_login(request: DevPasskeyRequest, db: Session = Depends(get_db)):
+    if not settings.dev_passkey:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if request.passkey != settings.dev_passkey:
+        raise HTTPException(status_code=401, detail="Invalid passkey")
+
+    # Reuses one fixed dev account so testing data persists across sessions
+    # instead of scattering test data across throwaway signups.
+    dev_email = "dev@apex.internal"
+    user = db.query(User).filter(User.email == dev_email).first()
+    if not user:
+        user = User(
+            id=generate_id("user"),
+            username="dev_tester",
+            email=dev_email,
+            hashed_password=hash_password(generate_id("dev")),
+            display_name="Dev Tester",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    access_token = create_access_token({"sub": user.id})
+    return {"access_token": access_token, "user_id": user.id}
+# ─────────────────────────────────────────────────────────────────────────
+
+
 # ── Current user ───────────────────────────────────────────────────────────
 
 @router.get("/me")
