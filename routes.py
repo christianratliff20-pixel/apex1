@@ -16,7 +16,7 @@ from models import (
     FeedItem, User, MacroLog, WorkoutLog, VitalLog,
     Group, GroupMessage, Challenge, Comment, Collection, BodyMetrics, CoachMessage,
     Supplement, SupplementLog, CustomVitalType, CustomVitalLog, Question, Answer,
-    WorkoutTemplate, CustomFood, MealPlan,
+    WorkoutTemplate, CustomFood, MealPlan, FoodSearchHistory, CoachTake,
 )
 from auth import get_current_user_id
 from helpers import generate_id
@@ -391,7 +391,7 @@ def coach_message(request: CoachMessageRequest, db: Session = Depends(get_db), u
     vital = db.query(VitalLog).filter(VitalLog.user_id == user.id, VitalLog.log_date == today).first()
     vitals_line = "  (not logged today)"
     if vital:
-        vitals_line = f"  Water {vital.water}oz, sleep {vital.sleep}hrs, energy {vital.energy_level}/5, mood {vital.mood}/5"
+        vitals_line = f"  Water {vital.water}oz, sleep {vital.sleep}hrs, mood: {vital.mood or 'not logged'}"
 
     # ── Persisted conversation history (most recent N messages, oldest first) ──
     history = db.query(CoachMessage).filter(CoachMessage.user_id == user.id).order_by(
@@ -454,6 +454,102 @@ def get_coach_history(db: Session = Depends(get_db), user_id: str = Depends(get_
     return {
         "messages": [{"role": h.role, "text": h.text, "created_at": h.created_at.isoformat()} for h in history]
     }
+
+
+COACH_TAKE_BATCH_SIZE = 4  # how many takes to generate per background refill
+COACH_TAKE_LOW_WATERMARK = 1  # regenerate when the unseen queue drops to this many
+
+def _build_coach_context(db: Session, user: User) -> str:
+    """Shared context block — same data the live coach chat already uses."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    week_ago = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    macro_log = db.query(MacroLog).filter(MacroLog.user_id == user.id, MacroLog.log_date == today).first()
+    logged = {
+        "calories": macro_log.calories if macro_log else 0,
+        "protein": macro_log.protein if macro_log else 0,
+    }
+    goals = {"calories": user.goal_calories, "protein": user.goal_protein}
+
+    recent_workouts = db.query(WorkoutLog).filter(
+        WorkoutLog.user_id == user.id, WorkoutLog.log_date >= week_ago
+    ).order_by(WorkoutLog.log_date.desc()).all()
+    workout_lines = [f"  - {w.log_date}: {w.name} ({w.duration}min)" for w in recent_workouts] or ["  (none logged this week)"]
+
+    vital = db.query(VitalLog).filter(VitalLog.user_id == user.id, VitalLog.log_date == today).first()
+    vitals_line = "  (not logged today)"
+    if vital:
+        vitals_line = f"  Water {vital.water}oz, sleep {vital.sleep}hrs, mood: {vital.mood or 'not logged'}"
+
+    return f"""Today's macros: {logged['calories']}/{goals['calories']} cal, {logged['protein']}/{goals['protein']}g protein
+This week's workouts:
+{chr(10).join(workout_lines)}
+Today's vitals:
+{vitals_line}"""
+
+
+def _generate_coach_takes_batch(db: Session, user: User, count: int = COACH_TAKE_BATCH_SIZE):
+    """Generates a batch of short, real-data-grounded observations and stores them unacknowledged."""
+    context = _build_coach_context(db, user)
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=600,
+            system=(
+                f"You are Vex, a direct, data-driven fitness coach. User preference: \"{user.coach_personality}\"\n\n"
+                f"{context}\n\n"
+                f"Generate exactly {count} short, distinct observations or nudges (1-2 sentences each) based on "
+                "the real data above. Each should stand alone — no greetings, no follow-up questions, just a "
+                "direct, specific observation or piece of advice. Respond with ONLY a JSON array of strings, "
+                "no other text, e.g. [\"take one\", \"take two\"]."
+            ),
+            messages=[{"role": "user", "content": "Generate the takes."}],
+        )
+        import json as json_module
+        raw = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+        takes = json_module.loads(raw)
+        for text in takes[:count]:
+            db.add(CoachTake(id=generate_id("take"), user_id=user.id, text=text))
+        db.commit()
+    except Exception:
+        # Best-effort — if generation fails, the queue just stays empty and
+        # the frontend shows nothing rather than erroring the whole page.
+        pass
+
+
+@coach_router.get("/takes/next")
+def get_next_coach_take(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """
+    Returns the oldest unacknowledged take. Refills the queue in the
+    background (best-effort, synchronous here since there's no job queue
+    yet) whenever it's running low, so the NEXT call already has stock
+    instead of the user hitting an empty queue mid-session.
+    """
+    user = _resolve_user(db, user_id)
+
+    unseen_count = db.query(CoachTake).filter(CoachTake.user_id == user.id, CoachTake.acknowledged == False).count()
+    if unseen_count <= COACH_TAKE_LOW_WATERMARK:
+        _generate_coach_takes_batch(db, user)
+
+    next_take = db.query(CoachTake).filter(
+        CoachTake.user_id == user.id, CoachTake.acknowledged == False
+    ).order_by(CoachTake.created_at.asc()).first()
+
+    if not next_take:
+        return {"take": None}
+
+    return {"take": {"id": next_take.id, "text": next_take.text}}
+
+
+@coach_router.post("/takes/{take_id}/acknowledge")
+def acknowledge_coach_take(take_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    user = _resolve_user(db, user_id)
+    take = db.query(CoachTake).filter(CoachTake.id == take_id, CoachTake.user_id == user.id).first()
+    if not take:
+        raise HTTPException(status_code=404, detail="Take not found")
+    take.acknowledged = True
+    db.commit()
+    return {"status": "acknowledged"}
 
 
 @coach_router.post("/analyze-food-photo")
@@ -772,13 +868,39 @@ def log_workout(request: WorkoutLogRequest, db: Session = Depends(get_db), user_
     return {"id": workout.id, "status": "logged"}
 
 
+class WorkoutReflectionRequest(BaseModel):
+    felt_during: Optional[str] = None  # "How did you feel during the workout?"
+    feel_now: Optional[str] = None  # "How do you feel now?"
+    personal_note: Optional[str] = None  # freeform, whatever else they want to say
+
+@workouts_router.post("/{workout_id}/reflect")
+def submit_workout_reflection(workout_id: str, request: WorkoutReflectionRequest, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """
+    The structured reflection template — distinct from the generic History
+    reflection endpoint, since this has real guided questions rather than
+    one freeform blob. personal_note lands in the existing `notes` column
+    (freeform, unstructured); felt_during/feel_now go into reflection_answers.
+    """
+    user = _resolve_user(db, user_id)
+    workout = db.query(WorkoutLog).filter(WorkoutLog.id == workout_id, WorkoutLog.user_id == user.id).first()
+    if not workout:
+        raise HTTPException(status_code=404, detail="Workout not found")
+
+    workout.reflection_answers = {"felt_during": request.felt_during, "feel_now": request.feel_now}
+    if request.personal_note is not None:
+        workout.notes = request.personal_note
+
+    db.commit()
+    return {"status": "saved"}
+
+
 @workouts_router.get("/{date}")
 def get_workouts_for_date(date: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
     user = _resolve_user(db, user_id)
     workouts = db.query(WorkoutLog).filter(WorkoutLog.user_id == user.id, WorkoutLog.log_date == date).all()
     return {"workouts": [
         {"id": w.id, "name": w.name, "duration": w.duration, "energy_level": w.energy_level,
-         "completed": w.completed, "exercises": w.exercises}
+         "completed": w.completed, "exercises": w.exercises, "notes": w.notes, "reflection_answers": w.reflection_answers}
         for w in workouts
     ]}
 
@@ -802,8 +924,7 @@ class VitalLogRequest(BaseModel):
     date: str
     water: float = 0
     sleep: float = 0
-    energy_level: int = 3
-    mood: int = 3
+    mood: Optional[str] = None  # "Great" / "Good" / "Okay" / "Rough" / "Bad" or custom text
 
 @vitals_router.post("/log")
 def log_vitals(request: VitalLogRequest, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
@@ -811,12 +932,12 @@ def log_vitals(request: VitalLogRequest, db: Session = Depends(get_db), user_id:
     existing = db.query(VitalLog).filter(VitalLog.user_id == user.id, VitalLog.log_date == request.date).first()
 
     if existing:
-        existing.water, existing.sleep, existing.energy_level, existing.mood = request.water, request.sleep, request.energy_level, request.mood
+        existing.water, existing.sleep, existing.mood = request.water, request.sleep, request.mood
         db.commit()
         return {"id": existing.id, "status": "updated"}
 
     vital = VitalLog(id=generate_id("vital"), user_id=user.id, log_date=request.date,
-                      water=request.water, sleep=request.sleep, energy_level=request.energy_level, mood=request.mood)
+                      water=request.water, sleep=request.sleep, mood=request.mood)
     db.add(vital)
     db.commit()
     db.refresh(vital)
@@ -894,13 +1015,43 @@ def log_custom_vital(date: str, type_id: str, request: CustomVitalValueRequest, 
     return {"id": log.id, "value": request.value}
 
 
+@vitals_router.get("/history")
+def get_vitals_history(days: int = 14, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """
+    Real historical entries, most recent first — replaces the old today-only
+    snapshot. Also computes a simple week-over-week average for Water/Sleep
+    since those are numeric; Mood stays as raw word entries since it's not
+    a number to average.
+    """
+    user = _resolve_user(db, user_id)
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    entries = db.query(VitalLog).filter(VitalLog.user_id == user.id, VitalLog.log_date >= cutoff).order_by(VitalLog.log_date.desc()).all()
+
+    if not entries:
+        return {"entries": [], "trends": {"water_avg": None, "sleep_avg": None}}
+
+    water_vals = [e.water for e in entries if e.water]
+    sleep_vals = [e.sleep for e in entries if e.sleep]
+
+    return {
+        "entries": [
+            {"date": e.log_date, "water": e.water, "sleep": e.sleep, "mood": e.mood}
+            for e in entries
+        ],
+        "trends": {
+            "water_avg": round(sum(water_vals) / len(water_vals), 1) if water_vals else None,
+            "sleep_avg": round(sum(sleep_vals) / len(sleep_vals), 1) if sleep_vals else None,
+        },
+    }
+
+
 @vitals_router.get("/{date}")
 def get_vitals_for_date(date: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
     user = _resolve_user(db, user_id)
     vital = db.query(VitalLog).filter(VitalLog.user_id == user.id, VitalLog.log_date == date).first()
     if not vital:
-        return {"water": 0, "sleep": 0, "energy_level": 3, "mood": 3}
-    return {"date": vital.log_date, "water": vital.water, "sleep": vital.sleep, "energy_level": vital.energy_level, "mood": vital.mood}
+        return {"water": 0, "sleep": 0, "mood": None}
+    return {"date": vital.log_date, "water": vital.water, "sleep": vital.sleep, "mood": vital.mood}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1347,9 +1498,9 @@ def get_history(
                 continue
             entries.append({
                 "id": v.id, "type": "vitals", "date": v.log_date,
-                "title": "Vitals logged", "summary": f"Water {v.water}oz · Sleep {v.sleep}hrs · Mood {v.mood}/5",
+                "title": "Vitals logged", "summary": f"Water {v.water}oz · Sleep {v.sleep}hrs" + (f" · Mood: {v.mood}" if v.mood else ""),
                 "completed": True, "reflection": v.reflection,
-                "detail": {"water": v.water, "sleep": v.sleep, "energy_level": v.energy_level, "mood": v.mood},
+                "detail": {"water": v.water, "sleep": v.sleep, "mood": v.mood},
             })
 
     if type is None or type == "body":
@@ -1366,6 +1517,64 @@ def get_history(
 
     entries.sort(key=lambda e: e["date"], reverse=True)
     return {"entries": entries[:limit]}
+
+
+@history_router.get("/overview")
+def get_overview_summary(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """
+    Real data for the Home Overview page: a genuine streak count (consecutive
+    days with ANY logged activity), today's actual to-dos (meal plans +
+    workouts scheduled/started today), and gap detection for the backfill
+    nudge — never decorative placeholders.
+    """
+    user = _resolve_user(db, user_id)
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Gather every distinct date with any logged activity, most recent first.
+    logged_dates = set()
+    for w in db.query(WorkoutLog.log_date).filter(WorkoutLog.user_id == user.id).all():
+        logged_dates.add(w[0])
+    for m in db.query(MacroLog.log_date).filter(MacroLog.user_id == user.id, MacroLog.calories > 0).all():
+        logged_dates.add(m[0])
+    for v in db.query(VitalLog.log_date).filter(VitalLog.user_id == user.id).all():
+        logged_dates.add(v[0])
+    for b in db.query(BodyMetrics.metric_date).filter(BodyMetrics.user_id == user.id).all():
+        logged_dates.add(b[0])
+
+    # Real consecutive-day streak, walking backward from today (or yesterday,
+    # so a streak isn't broken just because today hasn't been logged yet).
+    streak = 0
+    cursor = datetime.utcnow()
+    if today not in logged_dates:
+        cursor -= timedelta(days=1)  # allow "today not logged yet" without breaking the streak
+    while cursor.strftime("%Y-%m-%d") in logged_dates:
+        streak += 1
+        cursor -= timedelta(days=1)
+
+    # Gap detection for the backfill nudge — checks the last 5 days for any missing.
+    recent_gap_days = 0
+    check_cursor = datetime.utcnow() - timedelta(days=1)
+    for _ in range(5):
+        if check_cursor.strftime("%Y-%m-%d") not in logged_dates:
+            recent_gap_days += 1
+        check_cursor -= timedelta(days=1)
+
+    # Today's real to-dos: scheduled meal plans + any workout started but not completed today.
+    todays_meal_plans = db.query(MealPlan).filter(MealPlan.user_id == user.id, MealPlan.plan_date == today).all()
+    todays_workouts = db.query(WorkoutLog).filter(WorkoutLog.user_id == user.id, WorkoutLog.log_date == today).all()
+
+    return {
+        "streak_days": streak,
+        "recent_gap_days": recent_gap_days,
+        "show_backfill_nudge": recent_gap_days >= 2,
+        "todays_meal_plans": [
+            {"id": p.id, "food_name": p.food_name, "meal_time": p.meal_time, "completed": p.completed}
+            for p in todays_meal_plans
+        ],
+        "todays_workouts": [
+            {"id": w.id, "name": w.name, "completed": w.completed} for w in todays_workouts
+        ],
+    }
 
 
 class ReflectionRequest(BaseModel):
@@ -1466,13 +1675,27 @@ class CustomFoodRequest(BaseModel):
 
 @food_router.get("/custom")
 def list_custom_foods(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """
+    'My Foods' — two distinct sections:
+    - custom_foods: foods the user manually typed in themselves
+    - recent_foods: foods pulled from search that they've actually selected before,
+      auto-populated so they never have to re-search something they've used already,
+      sorted by how often they use it (most-used first).
+    """
     user = _resolve_user(db, user_id)
-    foods = db.query(CustomFood).filter(CustomFood.user_id == user.id, CustomFood.active == True).order_by(CustomFood.created_at.desc()).all()
+
+    custom = db.query(CustomFood).filter(CustomFood.user_id == user.id, CustomFood.active == True).order_by(CustomFood.created_at.desc()).all()
+    recent = db.query(FoodSearchHistory).filter(FoodSearchHistory.user_id == user.id).order_by(FoodSearchHistory.use_count.desc(), FoodSearchHistory.last_used_at.desc()).limit(30).all()
+
     return {
-        "foods": [
+        "custom_foods": [
             {"id": f.id, "name": f.name, "calories": f.calories, "protein": f.protein, "carbs": f.carbs, "fat": f.fat, "serving_size": f.serving_size}
-            for f in foods
-        ]
+            for f in custom
+        ],
+        "recent_foods": [
+            {"id": f.id, "name": f.name, "calories": f.calories, "protein": f.protein, "carbs": f.carbs, "fat": f.fat, "use_count": f.use_count, "usda_fdc_id": f.usda_fdc_id}
+            for f in recent
+        ],
     }
 
 
@@ -1501,6 +1724,47 @@ def delete_custom_food(food_id: str, db: Session = Depends(get_db), user_id: str
     food.active = False
     db.commit()
     return {"status": "removed"}
+
+
+class RecordFoodSelectionRequest(BaseModel):
+    name: str
+    calories: float = 0
+    protein: float = 0
+    carbs: float = 0
+    fat: float = 0
+    usda_fdc_id: Optional[str] = None
+
+@food_router.post("/custom/record-selection")
+def record_food_selection(request: RecordFoodSelectionRequest, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """
+    Called whenever a user selects a food from search (USDA or otherwise) —
+    auto-saves it into their 'recent foods' so it's there next time without
+    re-searching. If they've picked this exact food before (matched by USDA
+    ID), bumps its use count instead of creating a duplicate entry.
+    """
+    user = _resolve_user(db, user_id)
+
+    existing = None
+    if request.usda_fdc_id:
+        existing = db.query(FoodSearchHistory).filter(
+            FoodSearchHistory.user_id == user.id, FoodSearchHistory.usda_fdc_id == request.usda_fdc_id
+        ).first()
+
+    if existing:
+        existing.use_count += 1
+        existing.last_used_at = datetime.utcnow()
+        db.commit()
+        return {"id": existing.id, "use_count": existing.use_count}
+
+    entry = FoodSearchHistory(
+        id=generate_id("foodhist"), user_id=user.id, name=request.name,
+        calories=request.calories, protein=request.protein, carbs=request.carbs, fat=request.fat,
+        usda_fdc_id=request.usda_fdc_id,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return {"id": entry.id, "use_count": 1}
 
 
 # ═══════════════════════════════════════════════════════════════════════

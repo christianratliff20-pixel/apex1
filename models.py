@@ -147,7 +147,8 @@ class WorkoutLog(Base):
     
     exercises = Column(JSON, default=[])  # List of exercise objects
     energy_level = Column(Integer, default=3)  # 1-5
-    notes = Column(Text, nullable=True)
+    notes = Column(Text, nullable=True)  # freeform personal note — separate from the structured reflection below
+    reflection_answers = Column(JSON, nullable=True)  # {"felt_during": "...", "feel_now": "..."} — structured guided template, filled in after the fact
     completed = Column(Boolean, default=False)
     source = Column(String, default="logged")  # "logged" (backfilled), "live" (done through the app), "template" (from a saved routine)
     template_id = Column(String, ForeignKey("workout_templates.id"), nullable=True)
@@ -199,8 +200,7 @@ class VitalLog(Base):
     log_date = Column(String, index=True)  # YYYY-MM-DD
     water = Column(Float, default=0)  # oz
     sleep = Column(Float, default=0)  # hours
-    energy_level = Column(Integer, default=3)  # 1-5
-    mood = Column(Integer, default=3)  # 1-5
+    mood = Column(String, nullable=True)  # word-based: "Great"/"Good"/"Okay"/"Rough"/"Bad" or custom text
     reflection = Column(Text, nullable=True)  # user's post-hoc notes
     
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -369,6 +369,28 @@ class CustomFood(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class FoodSearchHistory(Base):
+    """
+    Auto-populated: any USDA food a user selects gets remembered here so
+    they never have to re-search it. Separate from CustomFood, which is
+    only for foods the user manually typed in themselves.
+    """
+    __tablename__ = "food_search_history"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True)
+
+    name = Column(String)
+    calories = Column(Float, default=0)
+    protein = Column(Float, default=0)
+    carbs = Column(Float, default=0)
+    fat = Column(Float, default=0)
+    usda_fdc_id = Column(String, nullable=True)
+
+    use_count = Column(Integer, default=1)  # bump each time it's reselected, so frequently-used foods surface first
+    last_used_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class MealPlan(Base):
     """A meal scheduled for a future date+time — a real to-do, not just a log of what happened."""
     __tablename__ = "meal_plans"
@@ -392,3 +414,21 @@ class MealPlan(Base):
     completed = Column(Boolean, default=False)  # checked off once actually eaten
 
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class CoachTake(Base):
+    """
+    A pre-generated 'coach's take' card for the Overview page — a short,
+    real-data-driven observation from Vex. Generated in small batches so
+    dismissing one is instant (no live API call/lag), not generated fresh
+    on every tap. When a user's unseen queue runs low, a new batch gets
+    generated in the background.
+    """
+    __tablename__ = "coach_takes"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True)
+
+    text = Column(Text)
+    acknowledged = Column(Boolean, default=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
