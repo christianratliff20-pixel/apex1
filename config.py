@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # but is heavily rate-limited — replace with a real key for production.
     usda_api_key: str = os.getenv("USDA_API_KEY", "DEMO_KEY")
 
+    # Redis — used as the Celery job queue for video editing. Set this to
+    # the Internal Connection URL from your Render Key Value instance.
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
     # OAuth
     google_client_id: str = os.getenv("GOOGLE_CLIENT_ID", "")
     google_client_secret: str = os.getenv("GOOGLE_CLIENT_SECRET", "")

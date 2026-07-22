@@ -7,12 +7,15 @@ pydantic-settings==2.1.0
 python-jose==3.3.0
 passlib==1.7.4
 python-multipart==0.0.6
-anthropic==0.7.1
+anthropic==0.117.0
 mux-python==5.1.2
 python-dotenv==1.0.0
 aiofiles==23.2.1
 httpx==0.25.1
 google-auth==2.56.0
-requests==2.34.2
+requests==2.32.3
 bcrypt==4.0.1
 email-validator==2.2.0
+celery==5.6.3
+redis==8.0.1
+ffmpeg-python==0.2.0

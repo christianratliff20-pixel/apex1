@@ -432,3 +432,29 @@ class CoachTake(Base):
     acknowledged = Column(Boolean, default=False)
 
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+class VideoEditJob(Base):
+    """
+    A queued/processing/completed video edit. The `edit_spec` JSON holds the
+    full requested edit (clips, trim points, text overlays, filters, music,
+    transitions) as a structured description — the Celery worker reads this
+    and builds the actual ffmpeg command from it. Status is polled by the
+    frontend the same way Mux upload status already is.
+    """
+    __tablename__ = "video_edit_jobs"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"), index=True)
+
+    status = Column(String, default="queued")  # queued, processing, done, failed
+    edit_spec = Column(JSON)  # the full requested edit, see EditSpec shape in routes.py
+    error_message = Column(Text, nullable=True)
+
+    # Result — populated once status == "done". Uploaded to Mux same as any
+    # other video, so playback reuses the existing Mux player pipeline.
+    result_mux_upload_id = Column(String, nullable=True)
+    result_mux_asset_id = Column(String, nullable=True)
+    result_mux_playback_id = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

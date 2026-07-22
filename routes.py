@@ -16,7 +16,7 @@ from models import (
     FeedItem, User, MacroLog, WorkoutLog, VitalLog,
     Group, GroupMessage, Challenge, Comment, Collection, BodyMetrics, CoachMessage,
     Supplement, SupplementLog, CustomVitalType, CustomVitalLog, Question, Answer,
-    WorkoutTemplate, CustomFood, MealPlan, FoodSearchHistory, CoachTake,
+    WorkoutTemplate, CustomFood, MealPlan, FoodSearchHistory, CoachTake, VideoEditJob,
 )
 from auth import get_current_user_id
 from helpers import generate_id
@@ -45,6 +45,7 @@ vitals_router = APIRouter()
 body_router = APIRouter()
 history_router = APIRouter()
 food_router = APIRouter()
+video_router = APIRouter()
 supplements_router = APIRouter()
 community_router = APIRouter()
 
@@ -1931,3 +1932,85 @@ def update_goals(request: GoalSettingsRequest, db: Session = Depends(get_db), us
         "goal_carbs": user.goal_carbs, "goal_fat": user.goal_fat,
         "goal_water": user.goal_water, "goal_workouts_per_week": user.goal_workouts_per_week,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# VIDEO EDITING — queues a real ffmpeg job on the Celery worker
+# ═══════════════════════════════════════════════════════════════════════
+
+class ClipSpec(BaseModel):
+    source_url: str
+    trim_start: float = 0
+    trim_end: Optional[float] = None
+
+class TransitionSpec(BaseModel):
+    type: str = "fade"  # fade, wipeleft, wiperight, dissolve, circleopen, etc. — real xfade transition names
+    duration: float = 0.5
+
+class TextOverlaySpec(BaseModel):
+    text: str
+    start: float = 0
+    end: Optional[float] = None
+    x: str = "center"  # "center" or a pixel number as string
+    y: str = "top"  # "top", "center", "bottom", or a pixel number as string
+    font_size: int = 32
+    color: str = "white"
+
+class FilterSpec(BaseModel):
+    type: str  # brightness, contrast, saturation, grayscale, sepia
+    value: float = 1.0
+
+class MusicSpec(BaseModel):
+    source_url: str
+    volume: float = 0.3
+
+class VideoEditRequest(BaseModel):
+    clips: List[ClipSpec]
+    transitions: List[TransitionSpec] = []
+    text_overlays: List[TextOverlaySpec] = []
+    filters: List[FilterSpec] = []
+    music: Optional[MusicSpec] = None
+
+@video_router.post("/edit")
+def create_video_edit_job(request: VideoEditRequest, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """
+    Queues a real video edit job on the Celery worker. Returns immediately
+    with a job_id — the actual processing happens asynchronously on the
+    Background Worker service, polled via GET /video/edit/{job_id}.
+    """
+    user = _resolve_user(db, user_id)
+
+    if not request.clips:
+        raise HTTPException(status_code=400, detail="At least one clip is required")
+
+    job_id = generate_id("videojob")
+    job = VideoEditJob(
+        id=job_id, user_id=user.id, status="queued",
+        edit_spec=request.model_dump(),
+    )
+    db.add(job)
+    db.commit()
+
+    # Import here (not top-level) so main.py/routes.py never hard-depend on
+    # Celery being importable in every environment — only when this endpoint
+    # is actually hit.
+    from celery_app import celery_app
+    celery_app.send_task("process_video_edit", args=[job_id])
+
+    return {"job_id": job_id, "status": "queued"}
+
+
+@video_router.get("/edit/{job_id}")
+def get_video_edit_status(job_id: str, db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """Poll this for job status — same pattern as Mux upload status polling."""
+    user = _resolve_user(db, user_id)
+    job = db.query(VideoEditJob).filter(VideoEditJob.id == job_id, VideoEditJob.user_id == user.id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    result = {"job_id": job.id, "status": job.status}
+    if job.status == "failed":
+        result["error"] = job.error_message
+    if job.status == "done":
+        result["mux_upload_id"] = job.result_mux_upload_id
+    return result
